@@ -1,0 +1,246 @@
+---
+title: "Organoid sizes"
+date: "2023-03-18"
+author: "Pierre-Luc"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: lumen
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(scater)
+  library(scran)
+  library(scuttle)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(Seurat)
+  library(scDblFinder)
+  library(batchelor)
+  library(ggplot2)
+  library(viridis)
+  library(patchwork)
+  library(ComplexHeatmap)
+  library(tricycle)
+  library(muscat)
+  library(sechm)
+})
+knitr::opts_chunk$set(dev="CairoPNG")
+```
+
+```{r, eval=FALSE}
+samples <- list.files(pattern="bc_matrix\\.h5$", full.names = TRUE, recursive = TRUE)
+names(samples) <- gsub("\\./run-|/count/sample_filtered_feature_bc_matrix\\.h5","",samples)
+sces <- lapply(names(samples), FUN=function(x){
+  y <- Read10X_h5(samples[x])
+  y <- SingleCellExperiment(list(counts=y), colData=data.frame(sample=x, barcode=colnames(y)))
+  colnames(y) <- paste0(x, ".", colnames(y))
+  y
+})
+sce <- do.call(cbind, sces)
+sce$type <- sce$sample <- factor(sce$sample)
+levels(sce$type) <- gsub("[0-9]","",levels(sce$sample))
+table(sce$sample)
+```
+
+
+# QC
+
+```{r}
+sce <- scuttle::addPerCellQC( sce, percent.top=c(10,50),
+                              subsets=list(mito=grep("MT-",row.names(sce),value=TRUE)))
+sce <- scuttle::addPerFeatureQC(sce)
+sce <- scDblFinder(sce, samples="sample")
+ggplot(as.data.frame(colData(sce)), aes(log10(sum), log10(detected), colour=percent.top_50)) +
+  geom_point(size=1) + geom_density_2d() + facet_wrap(~sample) + scale_color_viridis()
+ggplot(as.data.frame(colData(sce)), aes(percent.top_50, subsets_mito_percent, colour=log10(sum))) +
+  geom_point(size=1) + geom_density_2d() + facet_wrap(~sample)
+ggplot(as.data.frame(colData(sce)), aes(subsets_mito_percent)) +
+  geom_histogram(bins=100) + facet_wrap(~sample) + xlim(0,25)
+sce$QCexclude <- sce$percent.top_50>35 | sce$subsets_mito_percent>10
+ggplot(as.data.frame(colData(sce))[!sce$QCexclude,], aes(log10(sum), log10(detected), colour=percent.top_50)) +
+  geom_point(size=1) + facet_wrap(~sample) + scale_color_viridis()
+sce <- sce[rowData(sce)$detected>=1,!sce$QCexclude]
+saveRDS(sce, "SCE.rds")
+rm(sces)
+```
+
+# Seurat
+
+```{r, include=FALSE}
+sce <- readRDS("SCE.rds")
+```
+
+```{r}
+km <- as.list(read.delim("Fetal_Brain_Markers.tsv"))
+km <- lapply(km, FUN=function(x) intersect(unique(setdiff(x,"")), row.names(sce)))
+```
+
+```{r}
+se <- CreateSeuratObject(assay(sce), meta.data = as.data.frame(colData(sce)))
+se <- NormalizeData(se)
+se <- FindVariableFeatures(se, selection.method="vst", nfeatures=2000)
+# add known markers to variable genes
+VariableFeatures(se) <- union(unique(unlist(km)), VariableFeatures(se))
+se <- ScaleData(se)
+se <- RunPCA(se)
+se <- FindNeighbors(se, dims=1:15, k.param=30)
+se <- FindClusters(se, resolution=0.5)
+table(Idents(se),se$sample)
+se <- RunUMAP(se, dims = 1:15)
+saveRDS(se, "SeuratObject.rds")
+```
+
+```{r}
+se <- readRDS("SeuratObject.rds")
+```
+
+
+```{r}
+sce <- Seurat::as.SingleCellExperiment(se)
+sce$log10sum <- log10(sce$sum)
+sce$cluster <- sce$ident
+sce <- sce[,sce$scDblFinder.score<0.4]
+```
+
+```{r}
+# cell cycle
+sce <- project_cycle_space(sce, species="human", gname.type="SYMBOL")
+plotReducedDim(sce, "tricycleEmbedding") + annotate("point", x = -2.8, y=0.5)
+sce <- estimate_cycle_position(sce, dimred = "tricycleEmbedding",
+                               center.pc1=-2.8, center.pc2=0.5)
+cycScale <- scale_colour_gradientn(
+  colours=pals::kovesi.cyclic_mrybm_35_75_c68_s25(100),
+  breaks=pi*c(0.1, 0.5, 1, 1.4, 1.9), labels=c("G1/G0","S","G2M", "M", "G1/G0"))
+plotReducedDim(sce, "tricycleEmbedding", colour_by = "tricyclePosition") + cycScale
+```
+
+
+```{r, fig.width=10, fig.height=8}
+pp <- ( plotUMAP(sce, colour_by="log10sum") + plotUMAP(sce, colour_by="ident", text_by="ident")) /
+  (plotUMAP(sce, colour_by="scDblFinder.score") + 
+     plotUMAP(sce, colour_by="tricyclePosition") + cycScale + labs(colour="Cell cycle\ntheta") )
+pp
+```
+
+```{r}
+table(sce$sample, sce$cluster)
+```
+
+
+
+```{r, fig.height=6, fig.width=8}
+plotUMAP(sce, colour_by="MAP2") +
+  plotUMAP(sce, colour_by="PAX6") +
+  plotUMAP(sce, colour_by="HES1") +
+  plotUMAP(sce, colour_by="VIM") +
+  plotUMAP(sce, colour_by="NES") +
+  plotUMAP(sce, colour_by="SOX2") +
+  plotUMAP(sce, colour_by="NCAM1") +
+  plotUMAP(sce, colour_by="STMN2") +
+  plotUMAP(sce, colour_by="DCX")
+
+plotUMAP(sce, colour_by="FOXP2") +
+  plotUMAP(sce, colour_by="NR2F1") +
+  plotUMAP(sce, colour_by="RORB") +
+  plotUMAP(sce, colour_by="SATB2") +
+  plotUMAP(sce, colour_by="ADARB2")
+
+plotUMAP(sce, colour_by="cluster", other_fields="sample", text_by="cluster") + facet_wrap(~sample)
+```
+
+```{r}
+# mix of markers from https://www.cell.com/neuron/fulltext/S0896-6273(23)00206-4
+# and https://www.nature.com/articles/s41586-023-06473-y
+
+km <- list(
+  astro=c("ACSS1","FGFR3","GRAMD3","AGT","DAAM2","PRODH","AQP4","GJA1","GFAP","MYO10","S100B","APOE","ALDH1L1"),
+  NPCs=c("TOP2A","HMGB2","PBK","UBE2C","RRM2","CDCA3","CCNA2","FAM64A","TPX2"),
+  NSC=c("EOMES", "HOPX", "POU3F4"),
+  Neuroblasts=c("SEZ6","SOX11","RBFOX3","NEUROD4","SSTR2","CRMP1","DPYSL3","NEUROD6","NNAT","TUBB2B"),
+  GranuleCells=c("PROX1","CPLX2","PLEKHA2"),
+  ImmatureNeurons=c("NCAM1","PCDH9"),
+  FetalProgenitors=c("EOMES","PPP1R17","NEUROG1","CA12","PENK","SLA","SEMA3C","CAMKV","NRP1","NELL2","FRMD4B","GNG3","PPP2R2B","BHLH322","PALM"),
+  RGC=c("VIM","PAX6","GFAP","ASCL1","TLE4"),
+  EN.L56=c("FOXP2","NR2F1","TAC3"),
+  EN.L23=c("RORB","SATB2"),
+  EN.L4=c("NR2F1","ADARB2"),
+  IPC=c("UNC5D", "MEIS2","NEUROD6", "BCL11B", "AUTS2", "VIM")
+)
+km <- lapply(km, y=row.names(sce), FUN=intersect)
+
+pb <- aggregateData(sce, "logcounts", by=c("cluster"), fun="mean")
+assayNames(pb) <- "logcounts"
+assays(pb)$propOfMax <- exp(logcounts(pb))/rowMaxs(exp(logcounts(pb)))
+rowData(pb)$marker4 <- NA
+rowData(pb)[unlist(km),"marker4"] <- rep(names(km),lengths(km))
+
+sechm(pb, c(unlist(km)), assayName="logcounts", gaps_row="marker4",
+      show_colnames=TRUE, do.scale=TRUE, breaks=1, row_title_rot=0) + 
+  sechm(pb, c(unlist(km)), assayName = "propOfMax", show_colnames=TRUE,
+        do.scale=FALSE, hmcols=viridis::viridis(100), 
+        row_names_gp=gpar(fontsize=9))
+
+
+sechm(pb, c("HES1","PAX6","EOMES","NES","STMN2","GFAP","AQP4","VIM","TLE4","EGFR","SOX10","PDGFRA","SOX2","MAP2"),
+      assayName="propOfMax", show_colnames=TRUE, do.scale=FALSE, row_title_rot=0)
+sechm(pb, c(km$IPC,"EOMES"),
+      assayName="propOfMax", show_colnames=TRUE, do.scale=FALSE, row_title_rot=0)
+sechm(pb, c("SLC17A7","CAMK2A","GRIN2B","FEZF2","GAD1","LHX6","ADARB2","PVALB","SST","MAP2","STMN2"),
+      assayName="propOfMax", show_colnames=TRUE, do.scale=FALSE, row_title_rot=0)
+
+```
+
+
+```{r}
+NEC/RG (HES1+)
+  - HES1+ SOX10+ -> glial
+  - HES1+ SOX2+ -> neuronal self-renewing (progenitors)
+    - HES1- NES+ -> neuronal precursors
+      - NES- neurons
+
+tmp <- strsplit(
+"0 NPGs TLE4
+1 NPCs
+2 earlyNeurons Neuroblast/FetalProgs -> MAP2+STMN2
+3 NEC/RGC -> HES1
+4 upLay%Neurons neurons/L56
+5 Cycling%NPGs -> NES + SOX2
+6 NPCs -> NES + SOX2
+7 earlyNPGs -> HES1 + SOX2
+8 PAX6+NPCs/IPCs -> MAP2, PAX6 (partially ASCL1), AUTS2, UNC5D
+9 ?? --> eliminate
+10 Cycling%NPGs -> NES + SOX2
+11 lowLay%Neurons -> MAP2, L4
+12 NEC/RGC -> HES1
+13 ??
+14 Cycling%NPGs -> NES+VIM+SOX2
+15 NPGs -> NES+SOX2 no VIM 
+16 Cycling%NPGs -> HES1+SOX2
+17 PDGFRA+VIM+%RG/GPGs -> PDGFRA + VIM
+18 PDGFRA+HES1+%RG/GPGs -> PDGFRA + HES1
+19 Astrocyte%Progenitors -> VIM+SOX10", "\n")[[1]]
+tmp <- strsplit(tmp, " ")
+conv <- setNames(gsub("%","\n",sapply(tmp, FUN=function(x) x[2])),
+                 sapply(tmp, FUN=function(x) x[1]))
+sce$type1 <- conv[as.character(sce$cluster)]
+```
+
+```{r}
+sce <- sce[,sce$type1!="??"] # remove low libsize and population without clear known marker
+saveRDS(sce, "processed.SCE.rds")
+```
+
+
+```{r, fig.width=8, fig.height=5}
+plotUMAP(sce, colour_by="type1", text_by="type1")
+plotUMAP(sce, colour_by="type1", other_fields="sample") + facet_wrap(~sample)
+```
+
+```{r}
+sessionInfo()
+```
+

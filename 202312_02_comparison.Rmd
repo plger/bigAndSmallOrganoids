@@ -1,0 +1,136 @@
+---
+title: "Organoid sizes - comparison"
+date: "2023-12-12"
+author: "Pierre-Luc"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: lumen
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(scuttle)
+  library(scater)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(ggplot2)
+  library(patchwork)
+  library(miloR)
+  library(muscat)
+  library(sechm)
+  library(cowplot)
+  library(BiocParallel)
+  library(BiocNeighbors)
+  library(fgsea)
+  library(ANCOMBC)
+  library(phyloseq)
+})
+knitr::opts_chunk$set(dev="CairoPNG")
+```
+
+```{r}
+sce <- readRDS("processed.SCE.rds")
+```
+
+
+# Differential abundance
+
+```{r, eval=TRUE}
+milo <- buildGraph(Milo(sce), k=30, d=15, BNPARAM=AnnoyParam())
+milo <- makeNhoods(milo, k=30, d=15, prop=0.2)
+milo <- buildNhoodGraph(milo, overlap=2L)
+milo <- calcNhoodDistance(milo, d=15)
+milo <- countCells(milo, samples="sample", meta.data=colData(sce))
+saveRDS(milo, "milo.rds")
+```
+
+
+```{r}
+milo <- readRDS("milo.rds")
+milo.design <- as.data.frame(xtabs(~ type + sample, data=colData(milo)))
+milo.design <- milo.design[milo.design$Freq > 0, ]
+rownames(milo.design) <- milo.design$sample
+milo.design <- milo.design[colnames(nhoodCounts(milo)),]
+milo.res <- testNhoods(milo, design=~type, design.df=milo.design)
+saveRDS(milo.res, "milo.res.rds")
+
+plotUMAP(milo, colour_by="type1", text_by="type1") + 
+  plotNhoodGraphDA(milo, milo.res, alpha=0.5, node_stroke=0.1) +
+  labs(colour="Abundance\nlogFC in\nsmall") + plot_layout(guides="collect")
+```
+## Cluster-based
+
+```{r}
+cluster_abundances <- unclass(table(sce$type1, sce$sample))
+names(dimnames(cluster_abundances)) <- NULL
+cla <- SummarizedExperiment(list(counts=as.matrix(cluster_abundances)))
+cla$group <- gsub("[0-9]","",colnames(cla))
+# we calculate proportions
+assays(cla)$proportion <- 100*t(t(assay(cla))/colSums(assay(cla)))
+
+ps <- phyloseq(otu_table(assay(cla), taxa_are_rows=TRUE),
+               sample_data(as.data.frame(colData(cla))))
+out <- ancombc(ps, formula="group")
+out2 <- as.data.frame(sapply(out$res, FUN=function(x) x$groupP), row.names=row.names(cla))
+rowData(cla) <- out2
+saveRDS(cla, file="ancombc.SE.rds")
+sechm(cla, row.names(cla), assayName="proportion")
+```
+
+
+
+# Within-cluster differential state analysis
+
+```{r}
+sce <- prepSCE(sce, kid = "type1", sid = "sample", gid = "type")
+pb <- aggregateData(sce)
+res <- pbDS(pb)
+res <- res$table[[1]]
+res <- lapply(res, FUN=function(x){
+  x[order(x$p_val),]
+})
+saveRDS(res, file="withinCluster_DEA.rds")
+res2 <- dplyr::bind_rows(res)
+```
+
+```{r}
+gsets <- msigdbr::msigdbr(category="C5")
+gsets <- lapply(split(gsets, gsets$gs_subcat), FUN=function(gsets)
+  split(gsets$gene_symbol, gsets$gs_name))
+gsres <- bplapply(res, BPPARAM=MulticoreParam(4, progress=TRUE), FUN=function(x){
+  x <- setNames(x$logFC*(1-x$p_val), x$gene)
+  lapply(gsets, FUN=function(gs){
+    gr <- suppressWarnings(fgseaMultilevel(gs, x, minSize=5, maxSize=1000))
+    gr[order(gr$padj, abs(gr$NES)),]
+  })
+})
+saveRDS(gsres, "gsea_res.rds")
+```
+
+```{r}
+gsres <- readRDS("gsea_res.rds")
+bp <- lapply(gsres, FUN=function(x){ x[["GO:BP"]]})
+sigbp <- lapply(bp, FUN=function(x){
+  x$pathway[which(x$padj<0.05)]
+})
+topbps <- unlist(lapply(sigbp,head,n=2))
+topbps <- dplyr::bind_rows(lapply(bp, FUN=function(x){
+  x <- as.data.frame(x)
+  row.names(x) <- x$pathway
+  x[topbps,]
+}), .id="cluster")
+topbps$pathway <- gsub("_"," ",tolower(gsub("GOBP_","",topbps$pathway)))
+ggplot(topbps, aes(cluster, reorder(pathway,NES), size=-log10(padj), colour=NES)) + geom_point() +
+  theme_bw() + scale_colour_gradient2() + 
+  theme(axis.text.x=element_text(angle=45, hjust=1,vjust=1),
+        axis.title = element_blank())
+```
+
+
+```{r}
+sessionInfo()
+```
+

@@ -1,0 +1,198 @@
+---
+title: "Organoid sizes - Figures"
+author: "Pierre-Luc"
+output:
+  html_document:
+    code_folding: hide
+    toc: true
+    toc_float: true
+    theme: lumen
+---
+
+```{r}
+suppressPackageStartupMessages({
+  library(scuttle)
+  library(scater)
+  library(SingleCellExperiment)
+  library(Matrix)
+  library(ggplot2)
+  library(patchwork)
+  library(miloR)
+  library(muscat)
+  library(sechm)
+  library(cowplot)
+  library(BiocParallel)
+  library(BiocNeighbors)
+})
+knitr::opts_chunk$set(dev="CairoPNG")
+```
+
+```{r}
+# renaming some populations
+sce <- readRDS("processed.SCE.rds")
+lvls <- c("Astrocyte\nProgenitors", "PDGFRA+VIM+\nRG/GPGs", "PDGFRA+HES1+\nRG/GPGs", "NEC/RGC", "earlyNPGs", "Cycling\nNPGs", "NPCs", "NPGs", "earlyNeurons", "lowLay\nNeurons", "upLay\nNeurons", "PAX6+NPCs/IPCs")
+sce$type1 <- factor(sce$type1, lvls)
+levels(sce$type1)[c(2:3,4,10,12)] <- c("PDGFRA+VIM+\nGlia-like", "PDGFRA+HES1+\nGlia-like", "Neuro-\nepithelial", "Neurons", "PAX6+RG/IPCs")
+```
+
+```{r}
+sce$sample2 <- gsub("P","Small",gsub("G","Large",sce$sample))
+pdf("SuppFigure0.pdf", width=7, height=6)
+plotUMAP(sce, colour_by="type1", other_fields="sample2", rasterise=TRUE) +
+  facet_wrap(~sample2) + theme_void() + labs(colour="Cluster")
+dev.off()
+```
+
+
+```{r, fig.width=8, fig.height=5}
+p1 <- plotUMAP(sce, colour_by="type1", text_by="type1", text_size=3) + theme_void() + 
+    theme(legend.position="none", aspect.ratio = 1)
+cycScale <- scale_colour_gradientn(
+  colours=pals::kovesi.cyclic_mrybm_35_75_c68_s25(100),
+  breaks=pi*c(0.1, 0.5, 1, 1.4, 1.9), labels=c("G1/G0","S","G2M", "M", "G1/G0"))
+cycPlot <- plotUMAP(sce, colour_by="tricyclePosition", point_size=1, rasterise=TRUE) + 
+  theme_void() + cycScale +
+    theme(legend.position="bottom", aspect.ratio = 1,
+          legend.key.height=unit(0.25,"cm")) + labs(colour="Cell\ncycle   ")
+
+
+ratioplot <- function(x, y, labels=c(x,y), ...){
+  e1 <- colSums(logcounts(sce)[x,,drop=FALSE])
+  e2 <- colSums(logcounts(sce)[y,,drop=FALSE])
+  sce$marker_ratio <- pmin(pmax(e1/quantile(e1, 0.95)-e2/quantile(e2, 0.95), -1), 1)
+  plotUMAP(sce, colour_by="marker_ratio", point_size=1, point_alpha=0.4, rasterise=TRUE, ...) +
+    scale_color_gradient2(breaks=c(-1,0,1), labels=c(labels[2],"0", labels[1]),
+                          limits=c(-1,1)) +
+    labs(colour="") + theme_void() + 
+    theme(legend.position="bottom", aspect.ratio = 1,
+          legend.key.height=unit(0.25,"cm"))
+}
+markplot <- function(x){
+  e <- logcounts(sce)[x,]
+  sce[[x]] <- pmin(1,e/quantile(e,0.95))
+  plotUMAP(sce, colour_by=x, point_size=1, point_alpha=0.4, rasterise=TRUE) +
+    scale_color_gradient(low="white", high="darkred", breaks=c(0,1), labels=c("0",x), limits=c(0,1)) +
+    labs(colour="") + theme_void() + 
+    theme(legend.position="bottom", aspect.ratio = 1,
+          legend.key.height=unit(0.25,"cm"))
+}
+p3 <- plot_grid(cycPlot, markplot("MAP2"), ratioplot("HES1", "TUBB3"),
+                ratioplot("PDGFRA", "SOX2"), ratioplot("PAX6", "NES"),
+                ratioplot("VIM", c("STMN2","DCX"), labels=c("VIM","STMN2+DCX  ")),
+                nrow=2, scale=0.95)
+```
+
+```{r}
+milo <- readRDS("milo.rds")
+milo.res <- readRDS("milo.res.rds")
+rap <- plotNhoodGraphDA(milo, milo.res, alpha=0.5, node_stroke=0.1) + 
+  theme_void() + guides(size = "none", edge_width="none") +
+  theme(legend.position="bottom", aspect.ratio = 1, legend.key.height=unit(0.25,"cm"),
+        plot.title = element_text(size=12, hjust = 0.5)) +
+  labs(fill="Abundance  \nlogFC in\nsmall") + ggtitle("Differential abundance\n(in small vs large)")
+  
+```
+
+
+```{r, fig.width=7, fig.height=8.5}
+pp <- plot_grid(
+  p3,
+  plot_grid(p1, rap,
+            nrow=1, labels=LETTERS[2:3], scale=0.95, rel_widths=c(4,3)),
+  nrow=2, ncol=1, labels=c("A",NA)
+)
+pdf("Figure1.pdf", width=7, height=8.5)
+pp
+dev.off()
+```
+
+## More markers...
+
+
+
+## DEA
+
+```{r}
+dea <- readRDS("withinCluster_DEA.rds")
+res2 <- dplyr::bind_rows(dea)
+top <- dplyr::bind_rows(lapply(dea,FUN=function(x) head(x[which(x$p_adj.loc<0.05),],10)))
+
+volc <- ggplot(res2, aes(logFC, -log10(p_adj.loc), colour=p_adj.loc<0.05 & abs(logFC)>log2(1.5))) + 
+  ggrastr::geom_point_rast(size=1) + facet_wrap(~cluster_id) + theme_bw() + theme(legend.position = "none") +
+  ggrepel::geom_text_repel(data=top, aes(label=gene), colour="black", size=2.5,
+                           max.overlaps = 30, min.segment.length = 0)
+volc
+```
+
+```{r}
+pb <- aggregateData(sce, by=c("type1","sample"))
+pb$group <- gsub("[0-9]","",colnames(pb))
+pb <- pbFlatten(pb)
+assays(pb)$propOfMax <- exp(assay(pb,"logcpm"))/rowMaxs(exp(assay(pb,"logcpm")))
+
+km <- list(
+  Astrocyte=c("ACSS1","FGFR3","GRAMD3","AGT","DAAM2","PRODH","AQP4","GFAP","MYO10","S100B","APOE","ALDH1L1"),
+  NSC=c("EOMES", "HOPX", "POU3F4"),
+  ImmatureNeurons=c("NCAM1","PCDH9"),
+  "FetalProgenitors\nNeuroblasts"=c("EOMES","PPP1R17","NEUROG1","CA12","PENK","SLA","SEMA3C","CAMKV","NRP1","NELL2","FRMD4B","GNG3","PPP2R2B","BHLH322","PALM","SEZ6","SOX11","RBFOX3","NEUROD4","SSTR2","CRMP1","DPYSL3","NEUROD6","NNAT","TUBB2B"),
+  RadialGlia=c("VIM","PAX6","GFAP","ASCL1","TLE4"),
+  EN.L56=c("FOXP2","NR2F1","TAC3"),
+  EN.L23=c("RORB","SATB2"),
+  EN.L4=c("NR2F1","ADARB2"),
+  Inhibitory=c("GAD1","GAD2","LHX6","ADARB2","SCL6A1","GABBR2","PVALB","SST"),
+  Neuronal = c("SNAP25","STMN2","SYN1","RBFOX3","DLG4"),
+  Excitatory = c("SLC17A7", "SLC17A6", "SLC17A8", "CAMK2A", "GRIN2B", "MEIS2", "GRIN1"),
+  CellCycle=c("TOP2A","CCNA2","RRM2"),
+  IPC=c("UNC5D", "MEIS2","NEUROD6", "BCL11B", "AUTS2", "VIM")
+)
+km <- lapply(km, y=row.names(pb), FUN=intersect)
+rowData(pb)$marker4 <- NA
+rowData(pb)[unlist(km),"marker4"] <- rep(names(km),lengths(km))
+pb$group <- factor(pb$group, c("G","P"), c("large","small"))
+pb$cluster_id <- factor(pb$cluster_id, levels(sce$type1))
+```
+
+
+```{r, fig.height=10, fig.width=7}
+pdf("SuppFigure1.pdf", height=10, width=7)
+draw(sechm(pb, unlist(km), assayName="propOfMax", gaps_row="marker4",
+      row_title_rot=0, show_rownames=TRUE, breaks=FALSE,
+      row_names_gp=gpar(fontsize=9), top_annotation=c("group", "n_cells"),
+      column_title_gp=gpar(fontsize=10), column_title_rot=90), merge=TRUE)
+dev.off()
+```
+
+
+```{r}
+gsres <- readRDS("gsea_res.rds")
+bp <- lapply(gsres, FUN=function(x){ x[["GO:BP"]]})
+sigbp <- lapply(bp, FUN=function(x){
+  x$pathway[which(x$padj<0.05)]
+})
+topbps <- unlist(lapply(sigbp,head,n=2))
+topbps <- dplyr::bind_rows(lapply(bp, FUN=function(x){
+  x <- as.data.frame(x)
+  row.names(x) <- x$pathway
+  x[topbps,]
+}), .id="cluster")
+topbps$pathway <- gsub("_"," ",tolower(gsub("GOBP_","",topbps$pathway)))
+gsplot <- ggplot(topbps, aes(cluster, reorder(pathway,NES), size=-log10(padj), colour=NES)) + geom_point() +
+  theme_bw() + scale_colour_gradient2() + 
+  theme(axis.text.x=element_text(angle=45, hjust=1,vjust=1),
+        axis.title = element_blank())
+```
+
+
+
+```{r, fig.width=7, fig.height=8}
+pp <- plot_grid(volc, gsplot, nrow=2, rel_heights = c(3,2), labels="AUTO", scale=0.9)
+pdf("SuppFigure2.pdf", width=6.5, height=7.5)
+pp
+dev.off()
+```
+
+
+```{r}
+sessionInfo()
+```
+
